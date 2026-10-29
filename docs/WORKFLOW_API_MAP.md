@@ -1,0 +1,41 @@
+# Workflow API map
+
+Cookie-session authentication is used. Mutating routes validate role and business state server-side; successful actions emit persisted events/audit records where supported. The browser's event listener refetches current APIs instead of treating event payloads as state.
+
+| Workflow | Method / path | Roles in route/service | Payload / result | State and data effects |
+|---|---|---|---|---|
+| Login/session | `POST /api/auth/login`, `GET /api/auth/me`, `POST /api/auth/logout` | Public login; authenticated session | Credentials; session role/user | Establish or clear session.
+| User approval | `GET /api/admin/pending-users`, `POST /api/admin/approve-user`, `POST /api/admin/reject-user` | Administrator | User id, decision/reason; updated account | Account status and audit record.
+| Dashboard | `GET /api/dashboard` | Any authenticated active account | Current counts, available stock, active incident/zones/warehouses and persisted request trend | Read-only SQL aggregation; empty data remains zero/empty.
+| Request submission | `POST /api/requests` | Public endpoint; logged-in citizen is associated with session | Name, area, address, need, people, vulnerability and optional paired lat/lng | Creates unique request, calculates priority server-side, logs activity/event.
+| Request list/detail | `GET /api/requests`, `GET /api/requests/<id>`, `GET /api/requests/<id>/timeline` | Role-scoped; Citizen own records, Driver linked records, staff list | Actual request projection/timeline | Read only; Citizen identity/address is scoped.
+| Verify / duplicate | `POST /api/requests/<id>/verify`, `POST /api/requests/<id>/mark-duplicate` | Official/Admin for verification; duplicate route policy is separately enforced | Decision/reason or primary request id/reason | Verification state and persisted history; normal allocation requires Verified.
+| Allocation options | `GET /api/allocation-options/<request_id>` | Admin, Official, NGO | Database-backed drivers with active trip counts/availability and compatible vehicles | Read-only options for verified requests awaiting allocation. Busy/inactive drivers and unavailable vehicles cannot be selected.
+| Allocation | `POST /api/requests/<id>/allocate` | Authorized coordinator roles in route | `driver_user_id`, `vehicle_id` (selected in UI); returns request/dispatch/reservation ids | Requires verified request, mapped resources, stock and available selected driver/compatible vehicle; transaction reserves stock and links dispatch. The assigned driver sees the dispatch via role-scoped API refresh.
+| Route preview | Dispatch list/detail APIs plus browser OSRM Route service | Authenticated dispatch viewers | Persisted pickup/destination coordinates; OSRM road geometry, distance and duration | Uses recorded coordinates and external road-route estimate. No live driver GPS; missing coordinates or routing outage is shown without inventing a route.
+| Inventory | `GET /api/inventory`, `POST /api/inventory`, `PATCH /api/inventory/<id>` | Authenticated read; Administrator/Official/NGO mutation | Explicit resource, opening balance, target and warehouse id | Compatibility view derives balances from `warehouse_stock`; opening movement is ledgered.
+| Warehouses/resources | `GET /api/warehouses`, `GET /api/resources`, `GET /api/warehouses/<id>/stock` | API route policy; check route decorators in source | Master data and stock rows | Read-only database results.
+| Donations | `POST /api/donations`, `POST /api/donations/<id>/receive`, `POST /api/donations/<id>/verify` | NGO declaration; authorized warehouse/official verification per route | Resource ids and declared/received/accepted quantities | Only verified accepted in-kind quantities post to stock ledger; retry guarded.
+| Volunteer tasks | `POST /api/volunteer-tasks`, `POST /api/volunteer-tasks/<id>/<action>` | NGO creation/review; assigned Volunteer lifecycle per route | Task, volunteer id, type, quantity; action-specific fields | Persists assignment/status/checkpoints and refreshes task/roster views.
+| Dispatch lifecycle | `POST /api/dispatches/<id>/ready`, `/start`, `/arrive`, `/route-blockage`, `/reroute`, `/delivery-proof`, `/review-delivery`, `/return`, `/cancel` | Assigned Driver and explicit reviewer/coordinator roles per endpoint | Action-specific reason, item ids/quantities, proof reference | Updates dispatch/request/vehicle and stock ledger according to action; delivery requires proof and review.
+| Legacy dispatch advance | `POST /api/dispatches/<id>/advance` | Authenticated operational roles; Driver ownership enforced | No state payload | Loading to En route and En route to Arrived only; direct completion returns 409 `PROOF_REQUIRED`.
+| Shelters | `GET /api/shelters`, `POST /api/shelters/<id>/admissions`, `GET /api/shelter-admissions`, transfer/exit actions | Per-route authorized operational roles | Shelter, household count, transfer/exit details | Admission ledger updates occupancy; capacity/state checks occur server-side.
+| Funds | `GET /api/funds`, `/api/fund-budgets`, `/api/fund-requests`, `/api/fund-transactions` and fund request actions | Finance reads limited to Administrator/Official/NGO; mutations per action | Paise amounts, references, reasons and action | Totals computed from persisted budgets/transactions; approval is distinct from payment.
+| Events | `GET /api/events/stream`, `GET /api/events/poll` | Authenticated active account | Cursor id | Minimal event signals; client refetches current APIs, no global raw event payload.
+
+Error responses commonly use `400` for malformed input, `401` for missing session, `403` for role/ownership denial, `404` for absent records and `409` for invalid state or insufficient resources. Confirm exact route decorator and response in source before relying on any workflow not covered by tests.
+
+
+## Simultaneous request availability and first-valid claim (migration 11)
+
+`POST /api/requests` persists `created_at` as a timezone-aware UTC timestamp and immediately creates notifications and a system event for active Government staff and active coordinators of every approved NGO. A supplied `zone_id` is retained for location/reporting only; it does not filter NGO visibility or claim eligibility.
+
+`GET /api/requests` uses persisted records for Government and NGO dashboards. Every approved NGO coordinator can view each available request; the projection includes the response owner, organization name, assignment status and whether that NGO can act. Citizens see their own request's submission time and claim state. SSE and polling events trigger clients to refetch these APIs.
+
+Government acceptance uses `POST /api/requests/<id>/verify` with `decision`, `reason`, `response_personnel_id`, `driver_user_id`, and `vehicle_id`. NGO acceptance uses `POST /api/requests/<id>/ngo-assign` with `volunteer_id`, `driver_user_id`, `vehicle_id`, and optional `title`/`notes`. Both operations validate organization-owned, approved and available personnel and compatible vehicles before conditionally claiming the request and writing the response assignment in the same SQLite `BEGIN IMMEDIATE` transaction. Failed validation rolls back the claim and reservations. The first valid transaction to commit wins; subsequent claims and allocations by other organizations return a conflict.
+
+The winning response organization alone can allocate resources, using its own warehouse stock, approved driver and assigned vehicle. Dispatch, inventory reservation, delivery proof, audit and request events continue to use persisted owner-scoped records. Claim events become visible through SSE/polling only after the transaction commits. Migration 11 removes legacy escalation-cycle data; no deadline, timeout worker, automatic reassignment, or timeout-based routing remains.
+
+## Demo accounts
+
+`GET /api/demo-accounts` returns `[]` by default. Outside production, it returns approved seeded accounts only when `DRRAS_DEMO_MODE=true`; it is always disabled when `DRRAS_ENV=production` or `FLASK_ENV=production`. The login UI does not call this endpoint or show Quick Login buttons. Existing accounts continue to authenticate through the normal email/password route. The copy-friendly account list is in `docs/DEMO_ACCOUNT_CREDENTIALS.md`; the legacy `test@test.com` password is not recoverable from its stored hash.
