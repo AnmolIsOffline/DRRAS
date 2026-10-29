@@ -1686,9 +1686,11 @@ def list_driver_assignments():
     rows=conn.execute("""SELECT a.id AS assignment_id,a.request_id,a.owner_type,a.organization_id,
         a.status AS assignment_status,a.driver_decision,a.assigned_at,a.notes,a.dispatch_id,
         r.need,r.area,r.people_affected,r.status AS request_status,
+        r.lat AS destination_lat,r.lng AS destination_lng,
         COALESCE(o.name,'Government') AS response_owner_name,
         COALESCE(gp.name,v.name) AS response_companion_name,
         ve.registration_number,ve.vehicle_code,ve.vehicle_type,
+        wh.name AS warehouse_name,wh.lat AS pickup_lat,wh.lng AS pickup_lng,
         d.status AS dispatch_status
         FROM response_assignments a
         JOIN emergency_requests r ON r.id=a.request_id
@@ -1696,6 +1698,7 @@ def list_driver_assignments():
         LEFT JOIN government_personnel gp ON gp.id=a.government_personnel_id
         LEFT JOIN volunteers v ON v.id=a.volunteer_id
         LEFT JOIN vehicles ve ON ve.id=a.vehicle_id
+        LEFT JOIN warehouses wh ON wh.id=ve.warehouse_id
         LEFT JOIN dispatches d ON d.id=a.dispatch_id
         WHERE a.driver_user_id=? AND a.status IN ('Assigned','Active')
           AND a.driver_decision IN ('Pending','Accepted')

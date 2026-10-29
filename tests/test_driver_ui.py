@@ -70,3 +70,17 @@ def test_driver_dashboard_has_database_backed_accept_and_reject_actions():
     assert "@api_bp.route('/api/driver/assignments/<int:assignment_id>/<action>'" in routes
     assert 'decide_driver_assignment_service' in routes
     assert 'DRIVER_ACCEPTANCE_PENDING' in services
+
+
+def test_accepted_driver_assignment_keeps_route_map_and_navigation_action():
+    app_js = (ROOT / 'static' / 'js' / 'app.js').read_text(encoding='utf-8')
+    routes = (ROOT / 'api_routes.py').read_text(encoding='utf-8')
+    no_trip_view = app_js.split('if (!activeTrip)', 1)[1].split('const isRerouted', 1)[0]
+    assert "driverAssignments.find(a => a.driver_decision === 'Accepted')" in app_js
+    assert 'Current Trip &amp; Route' in no_trip_view
+    assert 'id="driver-real-map"' in no_trip_view
+    assert 'driver-assignment-route-btn' in no_trip_view
+    assert 'initDriverRealMap(acceptedAssignment)' in no_trip_view
+    assert 'showRouteModal(acceptedAssignment)' in no_trip_view
+    assert 'r.lat AS destination_lat,r.lng AS destination_lng' in routes
+    assert 'wh.name AS warehouse_name,wh.lat AS pickup_lat,wh.lng AS pickup_lng' in routes

@@ -1923,6 +1923,7 @@
     const myTrips = dispatches; // /api/dispatches already scopes Driver records by authenticated user ID.
     const activeTrip = myTrips.find(d => !['Delivered', 'Cancelled'].includes(d.status)) || null;
     const pendingAssignmentForTrip = activeTrip && driverAssignments.find(a => a.dispatch_id === activeTrip.id && a.driver_decision === 'Pending');
+    const acceptedAssignment = !activeTrip ? driverAssignments.find(a => a.driver_decision === 'Accepted') || null : null;
 
     if (!activeTrip) {
       container.innerHTML = `
@@ -1945,9 +1946,34 @@
           </p>
         </div>
 
+        ${acceptedAssignment ? `
+          <div class="card" style="margin-bottom:24px">
+            <div class="card-title">
+              <div>
+                <h3>Current Trip &amp; Route</h3>
+                <p>${escapeHtml(acceptedAssignment.warehouse_name || 'Pickup warehouse not recorded')} to ${escapeHtml(acceptedAssignment.area || 'Request destination not recorded')} · Live vehicle GPS unavailable</p>
+              </div>
+              <div class="map-layer-switcher">
+                <button type="button" class="map-layer-btn active" id="btn-driver-map-roads">Google Roads</button>
+                <button type="button" class="map-layer-btn" id="btn-driver-map-sat">Satellite</button>
+              </div>
+            </div>
+            <div id="driver-real-map" class="real-map-container" style="height:320px"></div>
+            <div class="driver-map-meta">
+              <span style="color:var(--text-secondary)">Assignment ${escapeHtml(acceptedAssignment.request_id)} · Awaiting dispatch allocation; this is a route estimate, not live tracking.</span>
+              <button type="button" class="btn btn-secondary btn-sm" id="driver-assignment-route-btn">${getIcon('MapPin')} Navigation Route</button>
+            </div>
+            <p id="driver-route-data-status" style="margin:0;padding:0 16px 14px;color:var(--text-muted);font-size:.84rem"></p>
+          </div>
+        ` : ''}
+
         ${renderRoleFeatureHub('Driver')}
       `;
       wireDriverAssignmentActions(container);
+      if (acceptedAssignment) {
+        initDriverRealMap(acceptedAssignment);
+        container.querySelector('#driver-assignment-route-btn').onclick = () => showRouteModal(acceptedAssignment);
+      }
       wireRoleHub(container);
       return;
     }
@@ -6190,7 +6216,7 @@
     backdrop.className = 'modal-backdrop';
     backdrop.innerHTML = `
       <div class="modal" style="width:min(760px,96vw)">
-        <div class="modal-head"><div><p class="eyebrow" style="color:var(--text-muted)">ROUTE FROM RECORDED LOCATIONS</p><h3>${dispatch ? `Dispatch ${escapeHtml(dispatch.id)} ? ${escapeHtml(dispatch.destination || dispatch.request_area || '')}` : `Route: ${escapeHtml(String(dispatchRef || 'not assigned'))}`}</h3></div><button type="button" class="modal-close-btn close-modal">${getIcon('X')}</button></div>
+        <div class="modal-head"><div><p class="eyebrow" style="color:var(--text-muted)">ROUTE FROM RECORDED LOCATIONS</p><h3>${dispatch ? `${dispatch.id ? `Dispatch ${escapeHtml(dispatch.id)}` : `Assignment ${escapeHtml(dispatch.request_id || '')}`} · ${escapeHtml(dispatch.destination || dispatch.request_area || dispatch.area || '')}` : `Route: ${escapeHtml(String(dispatchRef || 'not assigned'))}`}</h3></div><button type="button" class="modal-close-btn close-modal">${getIcon('X')}</button></div>
         <div class="modal-body" style="padding:0"><div style="position:relative"><div id="route-modal-map" class="real-map-container" style="height:340px"></div><div class="map-layer-switcher" style="position:absolute;top:10px;right:10px;z-index:1000;background:white"><button type="button" class="map-layer-btn active" id="route-roads-btn">Roads</button><button type="button" class="map-layer-btn" id="route-satellite-btn">Satellite</button></div></div><p id="route-modal-status" style="padding:12px 20px;color:var(--text-secondary)">Loading route from recorded coordinates?</p><p style="padding:0 20px 14px;color:var(--text-muted);font-size:.82rem">This is a route estimate between the registered warehouse and request location. It is not live vehicle tracking.</p></div>
         <div class="modal-actions"><button type="button" class="btn btn-secondary close-modal">Close</button></div>
       </div>`;
