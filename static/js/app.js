@@ -16,6 +16,7 @@
   let resources = [];
   let volunteers = [];
   let dispatches = [];
+  let driverAssignments = [];
   let shelters = [];
   let advisories = [];
   let incidents = [];
@@ -191,12 +192,13 @@
   // Load Data from Backend APIs
   async function loadAllData() {
     try {
-      const [dashRes, reqRes, invRes, volRes, dspRes, sheRes, funRes, whRes, resourceRes, advRes, incRes, noteRes, donationRes, donationOrgRes] = await Promise.all([
+      const [dashRes, reqRes, invRes, volRes, dspRes, driverAssignmentRes, sheRes, funRes, whRes, resourceRes, advRes, incRes, noteRes, donationRes, donationOrgRes] = await Promise.all([
         fetch('/api/dashboard').then(r => r.json()),
         fetch('/api/requests').then(r => r.json()),
         fetch('/api/inventory').then(r => r.json()),
         fetch('/api/volunteers').then(r => r.json()),
         fetch('/api/dispatches').then(r => r.json()),
+        session && session.role === 'Driver' ? fetch('/api/driver/assignments').then(r => r.ok ? r.json() : []) : Promise.resolve([]),
         fetch('/api/shelters').then(r => r.json()),
         session && ['Administrator', 'Government Official', 'NGO Coordinator'].includes(session.role) ? fetch('/api/funds').then(r => r.ok ? r.json() : null) : Promise.resolve(null),
         fetch('/api/warehouses').then(r => r.ok ? r.json() : []),
@@ -213,6 +215,7 @@
       inventory = Array.isArray(invRes) ? invRes : [];
       volunteers = Array.isArray(volRes) ? volRes : [];
       dispatches = Array.isArray(dspRes) ? dspRes : [];
+      driverAssignments = Array.isArray(driverAssignmentRes) ? driverAssignmentRes : [];
       shelters = Array.isArray(sheRes) ? sheRes : [];
       fundsData = funRes;
       warehouses = Array.isArray(whRes) ? whRes : [];
@@ -1872,13 +1875,58 @@
     wireRoleHub(container);
   }
 
+  function renderDriverAssignmentInbox() {
+    if (!driverAssignments.length) return '';
+    return `
+      <section class="card driver-assignment-inbox" aria-labelledby="driver-assignment-title" style="margin-bottom:24px">
+        <div class="card-title"><div><h3 id="driver-assignment-title">Response Assignments</h3><p>Review work assigned by Government or your NGO coordinator.</p></div><span class="badge badge-warning">${driverAssignments.filter(a => a.driver_decision === 'Pending').length} Awaiting decision</span></div>
+        <div style="display:grid;gap:12px">
+          ${driverAssignments.map(a => `
+            <article class="driver-assignment-row" style="display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:16px;border:1px solid var(--surface-border);border-radius:12px">
+              <div><b>${escapeHtml(a.request_id)} · ${escapeHtml(a.need || 'Response assignment')}</b><p style="margin:5px 0;color:var(--text-secondary)">${escapeHtml(a.area || 'Area not recorded')} · Assigned by ${escapeHtml(a.response_owner_name || (a.owner_type === 'government' ? 'Government' : 'NGO'))}</p>
+                <small style="color:var(--text-muted)">${a.vehicle_code ? `Vehicle ${escapeHtml(a.registration_number || a.vehicle_code)} · ${escapeHtml(a.vehicle_type || '')}` : 'Vehicle assignment saved'}${a.dispatch_id ? ` · Dispatch ${escapeHtml(a.dispatch_id)}` : ' · Awaiting dispatch allocation'}</small>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                ${a.driver_decision === 'Pending' ? `<button type="button" class="btn btn-primary btn-sm driver-assignment-accept" data-id="${a.assignment_id}">Accept</button><button type="button" class="btn btn-outline-danger btn-sm driver-assignment-decline" data-id="${a.assignment_id}">Reject</button>` : '<span class="badge badge-safe">Accepted · Awaiting dispatch</span>'}
+              </div>
+            </article>`).join('')}
+        </div>
+      </section>`;
+  }
+
+  function wireDriverAssignmentActions(container) {
+    const submitDecision = async (assignmentId, action, reason = '') => {
+      try {
+        const response = await fetch(`/api/driver/assignments/${assignmentId}/${action}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason })
+        });
+        const data = await response.json();
+        if (!response.ok) { showToast(data.error || `Could not ${action} assignment`, 'error'); return; }
+        showToast(action === 'accept' ? 'Assignment accepted. The response team can now allocate the dispatch.' : 'Assignment declined. The response team can select a replacement Driver.');
+        await loadAllData(); renderApp();
+      } catch (error) { showToast('Network error. Assignment decision was not saved.', 'error'); }
+    };
+    container.querySelectorAll('.driver-assignment-accept').forEach(button => {
+      button.onclick = () => submitDecision(button.dataset.id, 'accept');
+    });
+    container.querySelectorAll('.driver-assignment-decline').forEach(button => {
+      button.onclick = () => {
+        const reason = prompt('Why are you declining this response assignment?');
+        if (reason === null) return;
+        submitDecision(button.dataset.id, 'decline', reason.trim());
+      };
+    });
+  }
+
   // Role View: Driver
   function renderDriverView(container) {
     const myTrips = dispatches; // /api/dispatches already scopes Driver records by authenticated user ID.
     const activeTrip = myTrips.find(d => !['Delivered', 'Cancelled'].includes(d.status)) || null;
+    const pendingAssignmentForTrip = activeTrip && driverAssignments.find(a => a.dispatch_id === activeTrip.id && a.driver_decision === 'Pending');
 
     if (!activeTrip) {
       container.innerHTML = `
+        ${renderDriverAssignmentInbox()}
         <div class="card" style="background:linear-gradient(135deg, #1e3a5f 0%, #0f172a 100%);color:#ffffff;margin-bottom:24px">
           <div>
             <p style="color:#93c5fd;font-size:0.75rem;font-weight:700;letter-spacing:1px;text-transform:uppercase">DRIVER LOGISTICS BOARD</p>
@@ -1899,6 +1947,7 @@
 
         ${renderRoleFeatureHub('Driver')}
       `;
+      wireDriverAssignmentActions(container);
       wireRoleHub(container);
       return;
     }
@@ -1906,6 +1955,7 @@
     const isRerouted = activeTrip.status === 'Rerouted' || Boolean(activeTrip.reroute_notes);
 
     container.innerHTML = `
+      ${renderDriverAssignmentInbox()}
       ${isRerouted ? `
         <div class="reroute-alert-banner">
           ${getIcon('ShieldAlert')}
@@ -1926,7 +1976,7 @@
             <button type="button" class="btn btn-secondary btn-sm" id="driver-show-route-btn">
               ${getIcon('MapPin')} Navigation Route
             </button>
-            ${(activeTrip.status === 'Loading' || activeTrip.status === 'Ready') ? `
+            ${(activeTrip.status === 'Loading' || activeTrip.status === 'Ready') && !pendingAssignmentForTrip ? `
               <button type="button" class="btn btn-primary btn-sm" id="driver-start-btn">
                 ${getIcon('Truck')} Start Journey
               </button>
@@ -2070,6 +2120,7 @@
     const proofBtn = container.querySelector('#driver-proof-btn');
     if (proofBtn) proofBtn.onclick = () => openDeliveryProofModal(activeTrip.id);
 
+    wireDriverAssignmentActions(container);
     initDriverRealMap(activeTrip);
     wireRoleHub(container);
   }
@@ -2550,8 +2601,8 @@
                       <button type="button" class="btn btn-secondary btn-sm req-details-btn" data-id="${escapeHtml(r.id)}">
                         Details
                       </button>
-                      ${!r.response_owner_type && ['Administrator', 'Government Official'].includes(session.role) ? `<button type="button" class="btn btn-secondary btn-sm gov-verify-req-btn" data-id="${escapeHtml(r.id)}">Accept / Assign</button>` : ''}
-                      ${session.role === 'NGO Coordinator' && r.ngo_assignment_eligible ? `<button type="button" class="btn btn-secondary btn-sm ngo-assign-request-btn" data-id="${escapeHtml(r.id)}">Accept for NGO Assistance</button>` : ''}
+                      ${(!r.response_owner_type || (r.response_owner_type === 'government' && r.status === 'Awaiting allocation' && r.verification_status === 'Verified' && !r.response_assignment_status)) && ['Administrator', 'Government Official'].includes(session.role) ? `<button type="button" class="btn btn-secondary btn-sm gov-verify-req-btn" data-id="${escapeHtml(r.id)}">${r.response_owner_type ? 'Reassign Response Team' : 'Accept / Assign'}</button>` : ''}
+                      ${session.role === 'NGO Coordinator' && r.ngo_assignment_eligible ? `<button type="button" class="btn btn-secondary btn-sm ngo-assign-request-btn" data-id="${escapeHtml(r.id)}">${r.response_owner_type === 'ngo' ? 'Reassign NGO Team' : 'Accept for NGO Assistance'}</button>` : ''}
                       ${session.role === 'NGO Coordinator' && r.ngo_assignment_active ? `<button type="button" class="btn btn-primary btn-sm allocate-btn" data-id="${escapeHtml(r.id)}">Allocate NGO Resources</button>` : ''}
                       ${['Administrator','Government Official'].includes(session.role) && r.response_owner_type === 'government' && r.status === 'Awaiting allocation' && r.verification_status === 'Verified' ? `<button type="button" class="btn btn-primary btn-sm allocate-btn" data-id="${escapeHtml(r.id)}">Allocate</button>` : ''}
                     </div>
@@ -2670,7 +2721,7 @@
                   <button type="button" class="btn btn-secondary btn-sm req-details-btn" data-id="${escapeHtml(r.id)}">
                     Inspect Details
                   </button>
-                  ${r.response_owner_type === 'government' && r.verification_status === 'Verified' ? `<button type="button" class="btn btn-primary btn-sm allocate-btn" data-id="${escapeHtml(r.id)}">Approve Allocation ${getIcon('ArrowUpRight')}</button>` : r.response_owner_type === 'ngo' && r.response_organization_id === session.organization_id ? `<button type="button" class="btn btn-primary btn-sm allocate-btn" data-id="${escapeHtml(r.id)}">Allocate NGO Resources ${getIcon('ArrowUpRight')}</button>` : !r.response_owner_type && ['Administrator', 'Government Official'].includes(session.role) ? `<span class="badge badge-warning">Available for response</span><button type="button" class="btn btn-secondary btn-sm gov-verify-req-btn" data-id="${escapeHtml(r.id)}">Verify / Triage</button>` : `<span class="badge badge-neutral">Claimed by ${r.response_owner_type === 'government' ? 'Government' : escapeHtml(r.response_organization_name || 'an NGO')}</span>`}
+                  ${r.response_owner_type === 'government' && r.verification_status === 'Verified' ? (r.response_assignment_status ? `<button type="button" class="btn btn-primary btn-sm allocate-btn" data-id="${escapeHtml(r.id)}">Approve Allocation ${getIcon('ArrowUpRight')}</button>` : `<button type="button" class="btn btn-secondary btn-sm gov-verify-req-btn" data-id="${escapeHtml(r.id)}">Assign / Reassign Team</button>`) : r.response_owner_type === 'ngo' && r.response_organization_id === session.organization_id ? (r.ngo_assignment_active ? `<button type="button" class="btn btn-primary btn-sm allocate-btn" data-id="${escapeHtml(r.id)}">Allocate NGO Resources ${getIcon('ArrowUpRight')}</button>` : `<button type="button" class="btn btn-secondary btn-sm ngo-assign-request-btn" data-id="${escapeHtml(r.id)}">Assign / Reassign NGO Team</button>`) : !r.response_owner_type && ['Administrator', 'Government Official'].includes(session.role) ? `<span class="badge badge-warning">Available for response</span><button type="button" class="btn btn-secondary btn-sm gov-verify-req-btn" data-id="${escapeHtml(r.id)}">Verify / Triage</button>` : `<span class="badge badge-neutral">Claimed by ${r.response_owner_type === 'government' ? 'Government' : escapeHtml(r.response_organization_name || 'an NGO')}</span>`}
                 </div>
               </div>
             `).join('')}
@@ -6254,9 +6305,9 @@
       <div class="modal" style="width:min(560px,96vw)">
         <div class="modal-head"><div><p class="eyebrow">RESOURCE ALLOCATION ? ${escapeHtml(reqId)}</p><h3>${escapeHtml(options.owner_type === 'ngo' ? 'Allocate NGO-owned resources' : 'Allocate Government-owned resources')}</h3></div><button type="button" class="modal-close-btn close-modal">${getIcon('X')}</button></div>
         <form id="allocation-assignment-form"><div class="modal-body">
-          ${team ? `<div class="card" style="padding:14px"><b>Assigned response team</b><p>${escapeHtml(team.personnel_name || team.volunteer_name || 'Responder')} ? ${escapeHtml(team.personnel_category || 'NGO Volunteer')}</p><p>Driver: ${escapeHtml(team.driver_name)} ? Vehicle: ${escapeHtml(team.vehicle_code)} (${escapeHtml(team.vehicle_type)})</p><small>Owner: ${escapeHtml(options.owner_type === 'ngo' ? String(options.organization_id) : 'Government')}</small></div>` : `<p class="alert-banner critical">No response team is assigned to this owner. Assign the required responder/Volunteer, approved Driver, and compatible vehicle first.</p>`}
+          ${team ? `<div class="card" style="padding:14px"><b>Assigned response team</b><p>${escapeHtml(team.personnel_name || team.volunteer_name || 'Responder')} ? ${escapeHtml(team.personnel_category || 'NGO Volunteer')}</p><p>Driver: ${escapeHtml(team.driver_name)} ? Vehicle: ${escapeHtml(team.vehicle_code)} (${escapeHtml(team.vehicle_type)})</p><small>Owner: ${escapeHtml(options.owner_type === 'ngo' ? String(options.organization_id) : 'Government')} · Driver decision: ${escapeHtml(team.driver_decision || 'Accepted')}</small>${team.driver_decision === 'Pending' ? '<p class="alert-banner" style="margin-top:10px">Waiting for the assigned Driver to accept before dispatch allocation.</p>' : ''}</div>` : `<p class="alert-banner critical">No response team is assigned to this owner. Assign the required responder/Volunteer, approved Driver, and compatible vehicle first.</p>`}
           <p class="help-text">Allocation checks the owner?s active warehouse stock and creates a persisted reservation and dispatch. The selected team and vehicle are revalidated by the server.</p>
-        </div><div class="modal-actions"><button type="button" class="btn btn-secondary close-modal">Cancel</button><button type="submit" class="btn btn-primary" ${team ? '' : 'disabled'}>Reserve &amp; dispatch</button></div></form>
+        </div><div class="modal-actions"><button type="button" class="btn btn-secondary close-modal">Cancel</button><button type="submit" class="btn btn-primary" ${team && team.driver_decision === 'Accepted' ? '' : 'disabled'}>Reserve &amp; dispatch</button></div></form>
       </div>`;
     document.body.appendChild(backdrop); backdrop.querySelectorAll('.close-modal').forEach(b => b.onclick = () => backdrop.remove());
     backdrop.querySelector('#allocation-assignment-form').onsubmit = async e => {

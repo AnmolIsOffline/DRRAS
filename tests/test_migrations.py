@@ -28,6 +28,7 @@ def test_fresh_database_migrations():
         assert 8 in applied_versions
         assert 9 in applied_versions
         assert 11 in applied_versions
+        assert 13 in applied_versions
         assert conn.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='request_escalation_cycles'").fetchone()[0] == 0
         request_columns = [c['name'] for c in conn.execute('PRAGMA table_info(emergency_requests)').fetchall()]
         assert {'response_owner_type', 'response_organization_id', 'claimed_at'} <= set(request_columns)
@@ -52,6 +53,8 @@ def test_fresh_database_migrations():
         assert 'audit_logs' in tables
         assert 'notifications' in tables
         assert 'district' in [c['name'] for c in conn.execute('PRAGMA table_info(shelters)').fetchall()]
+        assignment_columns = {c['name'] for c in conn.execute('PRAGMA table_info(response_assignments)').fetchall()}
+        assert {'driver_decision','driver_decided_at','driver_decline_reason'} <= assignment_columns
 
         # Legacy migration markers can be reapplied without restoring timeout state or losing requests.
         conn.execute("INSERT INTO emergency_requests(id,requester_name,area,address,need,people_affected,priority_score,status,created_at) VALUES('REQ-LEGACY-1','Legacy Citizen','Ward 1','Ward 1','Food',2,50,'Awaiting allocation','2026-10-27 00:00:00')")

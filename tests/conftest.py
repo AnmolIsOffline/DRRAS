@@ -1,6 +1,7 @@
 import os
 import tempfile
 import pytest
+from werkzeug.security import check_password_hash
 
 import sys
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -81,8 +82,21 @@ def verify_request_with_team(client, request_id, reason='Verified by Government 
     driver = next((d for d in options['drivers'] if d['available']), None)
     vehicle = next((v for v in options['vehicles'] if v['available']), None)
     assert personnel and driver and vehicle, options
-    return client.post(f'/api/requests/{request_id}/verify', json={
+    response = client.post(f'/api/requests/{request_id}/verify', json={
         'decision': decision, 'reason': reason,
         'response_personnel_id': personnel['id'],
         'driver_user_id': driver['id'], 'vehicle_id': vehicle['id']
     })
+    if response.status_code == 200 and decision == 'Verified':
+        conn=get_db()
+        assigned=conn.execute("SELECT u.email,u.password FROM response_assignments a JOIN users u ON u.id=a.driver_user_id WHERE a.request_id=? AND a.owner_type='government' ORDER BY a.id DESC LIMIT 1",(request_id,)).fetchone()
+        conn.close()
+        driver_password=next((candidate for candidate in ('driver123','driveDemo26!') if check_password_hash(assigned['password'],candidate)),None)
+        assert driver_password, 'The assigned demo Driver credential must match its stored hash.'
+        client.post('/api/auth/login',json={'email':assigned['email'],'password':driver_password})
+        decisions=client.get('/api/driver/assignments').get_json()
+        pending=next(item for item in decisions if item['request_id']==request_id)
+        accepted=client.post(f"/api/driver/assignments/{pending['assignment_id']}/accept",json={})
+        assert accepted.status_code == 200, accepted.get_json()
+        client.post('/api/auth/login',json={'email':'official@drras.in','password':'official123'})
+    return response

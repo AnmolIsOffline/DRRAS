@@ -790,7 +790,9 @@ def ngo_response_options(request_id):
         LEFT JOIN response_assignments a ON a.request_id=r.id AND a.owner_type=r.response_owner_type
           AND a.organization_id IS r.response_organization_id AND a.status IN ('Assigned','Active','Completed')
         WHERE r.id=? ORDER BY a.id DESC LIMIT 1""",(request_id,)).fetchone()
-    eligible=bool(owner['response_owner_type'] is None
+    active_owner_assignment=bool(conn.execute("SELECT 1 FROM response_assignments WHERE request_id=? AND owner_type='ngo' AND organization_id=? AND status IN ('Assigned','Active')",(request_id,org_id)).fetchone())
+    eligible=bool((owner['response_owner_type'] is None or
+        (owner['response_owner_type']=='ngo' and owner['response_organization_id']==org_id and not active_owner_assignment))
         and req['status'] not in ('Rejected','Closed','Delivered','Duplicate','Cancelled')
         and req['verification_status']!='Rejected')
     volunteers=conn.execute("""SELECT v.id,v.name,v.skill,v.zone,v.status,o.name AS organization_name,'NGO Volunteer' AS personnel_role,
@@ -811,6 +813,7 @@ def ngo_response_options(request_id):
         'blocked_reason':('This request has already been claimed or is no longer available.' if not eligible else None),
         'response_owner_type':owner['response_owner_type'],'response_organization_id':owner['response_organization_id'],
         'response_organization_name':owner['organization_name'],'assignment_status':owner['assignment_status'],
+        'eligible':eligible,
         'volunteers':[dict(v,available=(v['status']=='Available' and v['active_tasks']==0)) for v in volunteers],
         'drivers':[dict(d,available=is_available_driver(conn,d['id'],'ngo',org_id,request_id)) for d in drivers],
         'vehicles':[dict(v,available=(v['status']=='Available' and v['current_driver_user_id'] is None)) for v in vehicles]})
@@ -845,17 +848,27 @@ def assign_ngo_request(request_id):
             services.claim_request_service(conn,request_id,'ngo',org_id,session['user_id'])
             next_num=(conn.execute("SELECT MAX(CAST(SUBSTR(id,6) AS INTEGER)) FROM volunteer_tasks").fetchone()[0] or 0)+1
             task_id=f'TASK-{next_num:03d}'
-            cur=conn.execute("INSERT INTO response_assignments (request_id,owner_type,organization_id,volunteer_id,driver_user_id,vehicle_id,status,assigned_by_user_id,notes) VALUES (?,'ngo',?,?,?,?,'Assigned',?,?)",(request_id,org_id,vid,did,vehicle_id,session['user_id'],(data.get('notes') or '').strip()))
+            existing_assignment=conn.execute("SELECT id,status FROM response_assignments WHERE request_id=? AND owner_type='ngo' AND organization_id=?",(request_id,org_id)).fetchone()
+            if existing_assignment:
+                if existing_assignment['status']!='Cancelled': raise BusinessLogicError('This NGO already has an active response assignment for the request.','ASSIGNMENT_EXISTS',409)
+                assignment_id=existing_assignment['id']
+                conn.execute("""UPDATE response_assignments SET volunteer_id=?,government_personnel_id=NULL,
+                    driver_user_id=?,vehicle_id=?,dispatch_id=NULL,status='Assigned',driver_decision='Pending',
+                    driver_decided_at=NULL,driver_decline_reason=NULL,assigned_by_user_id=?,assigned_at=CURRENT_TIMESTAMP,notes=?
+                    WHERE id=?""",(vid,did,vehicle_id,session['user_id'],(data.get('notes') or '').strip(),assignment_id))
+            else:
+                cur=conn.execute("INSERT INTO response_assignments (request_id,owner_type,organization_id,volunteer_id,driver_user_id,vehicle_id,status,driver_decision,assigned_by_user_id,notes) VALUES (?,'ngo',?,?,?,?,'Assigned','Pending',?,?)",(request_id,org_id,vid,did,vehicle_id,session['user_id'],(data.get('notes') or '').strip()))
+                assignment_id=cur.lastrowid
             conn.execute("INSERT INTO volunteer_tasks (id,incident_id,zone_id,organization_id,volunteer_id,request_id,title,task_type,description,quantity_expected,status,assigned_by_user_id) VALUES (?,?,?,?,?,?,?,?,?,0,'Assigned',?)",(task_id,req['incident_id'],req['zone_id'],org_id,vid,request_id,(data.get('title') or f"NGO response for {request_id}").strip(),'Request Response',(data.get('notes') or f"Support {req['need']} in {req['area']}").strip(),session['user_id']))
             conn.execute("UPDATE volunteers SET status='On task' WHERE id=? AND status='Available'",(vid,))
             if conn.execute('SELECT changes()').fetchone()[0]!=1: raise BusinessLogicError('Selected Volunteer was assigned concurrently. Refresh and retry.','VOLUNTEER_UNAVAILABLE',409)
             conn.execute("UPDATE vehicles SET status='Reserved',current_driver_user_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='Available'",(did,vehicle_id))
             if conn.execute('SELECT changes()').fetchone()[0] != 1: raise BusinessLogicError('Selected vehicle was taken by another assignment. Refresh and retry.','VEHICLE_UNAVAILABLE',409)
-            database.log_audit_event(conn,session['user_id'],'ASSIGN_NGO_RESPONSE','response_assignments',cur.lastrowid,new_state={'request_id':request_id,'organization_id':org_id,'volunteer_id':vid,'driver_user_id':did,'vehicle_id':vehicle_id})
+            database.log_audit_event(conn,session['user_id'],'ASSIGN_NGO_RESPONSE','response_assignments',assignment_id,new_state={'request_id':request_id,'organization_id':org_id,'volunteer_id':vid,'driver_user_id':did,'vehicle_id':vehicle_id})
             database.log_system_event(conn,'ngo_response_assigned',{'request_id':request_id,'organization_id':org_id,'task_id':task_id})
             if vol['user_id']: database.create_notification(conn,vol['user_id'],'task_assigned','NGO response task assigned',f'You were assigned to {request_id}.','volunteer_tasks',task_id)
             database.create_notification(conn,did,'dispatch_assigned','NGO response assignment',f'You were assigned to support {request_id}.','emergency_requests',request_id)
-        return jsonify({'assignment_id':cur.lastrowid,'task_id':task_id,'status':'Assigned','request_id':request_id,'organization_id':org_id}),201
+        return jsonify({'assignment_id':assignment_id,'task_id':task_id,'status':'Assigned','driver_decision':'Pending','request_id':request_id,'organization_id':org_id}),201
     except BusinessLogicError as e:
         return jsonify({'error':e.message,'code':e.code}),e.status_code
     except sqlite3.IntegrityError:
@@ -1666,6 +1679,45 @@ def list_vehicles():
     rows=conn.execute('SELECT v.*,o.name AS owner_name FROM vehicles v LEFT JOIN organizations o ON o.id=v.owner_organization_id'+where+' ORDER BY v.id ASC',params).fetchall()
     return jsonify([dict(r) for r in rows])
 
+@api_bp.route('/api/driver/assignments', methods=['GET'])
+@roles_required('Driver')
+def list_driver_assignments():
+    conn=get_db(); user_id=session['user_id']
+    rows=conn.execute("""SELECT a.id AS assignment_id,a.request_id,a.owner_type,a.organization_id,
+        a.status AS assignment_status,a.driver_decision,a.assigned_at,a.notes,a.dispatch_id,
+        r.need,r.area,r.people_affected,r.status AS request_status,
+        COALESCE(o.name,'Government') AS response_owner_name,
+        COALESCE(gp.name,v.name) AS response_companion_name,
+        ve.registration_number,ve.vehicle_code,ve.vehicle_type,
+        d.status AS dispatch_status
+        FROM response_assignments a
+        JOIN emergency_requests r ON r.id=a.request_id
+        LEFT JOIN organizations o ON o.id=a.organization_id
+        LEFT JOIN government_personnel gp ON gp.id=a.government_personnel_id
+        LEFT JOIN volunteers v ON v.id=a.volunteer_id
+        LEFT JOIN vehicles ve ON ve.id=a.vehicle_id
+        LEFT JOIN dispatches d ON d.id=a.dispatch_id
+        WHERE a.driver_user_id=? AND a.status IN ('Assigned','Active')
+          AND a.driver_decision IN ('Pending','Accepted')
+          AND (a.dispatch_id IS NULL OR (a.driver_decision='Pending' AND d.status='Loading'))
+        ORDER BY a.assigned_at DESC,a.id DESC""", (user_id,)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@api_bp.route('/api/driver/assignments/<int:assignment_id>/<action>', methods=['POST'])
+@roles_required('Driver')
+def driver_assignment_action(assignment_id, action):
+    if action not in ('accept','decline'):
+        return jsonify({'error':'Action must be accept or decline.','code':'INVALID_ACTION'}),400
+    data=request.get_json(silent=True) or {}
+    conn=get_db()
+    try:
+        with conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row=services.decide_driver_assignment_service(conn,assignment_id,session['user_id'],action,data.get('reason'))
+        return jsonify(dict(row))
+    except BusinessLogicError as e:
+        return jsonify({'error':e.message,'code':e.code}),e.status_code
+
 @api_bp.route('/api/dispatches/<dispatch_id>', methods=['GET'])
 @login_required
 @dispatch_scope_required
@@ -1710,6 +1762,10 @@ def dispatch_ready(dispatch_id):
     row = conn.execute("SELECT * FROM dispatches WHERE id = ?", (dispatch_id,)).fetchone()
     if not row:
         return jsonify({'error': 'Dispatch not found'}), 404
+    if session.get('role') == 'Driver':
+        decision=conn.execute("SELECT driver_decision FROM response_assignments WHERE dispatch_id=? AND driver_user_id=? ORDER BY id DESC LIMIT 1",(dispatch_id,session['user_id'])).fetchone()
+        if decision and decision['driver_decision']!='Accepted':
+            return jsonify({'error':'Accept this assigned dispatch before marking it ready.','code':'DRIVER_ACCEPTANCE_PENDING'}),409
     with conn:
         conn.execute("UPDATE dispatches SET status = 'Ready', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (dispatch_id,))
         if row['vehicle_id']:

@@ -4,6 +4,7 @@ import os
 
 import database
 from conftest import verify_request_with_team
+from werkzeug.security import check_password_hash
 
 
 def _new_request(client, zone='Z-01'):
@@ -28,6 +29,17 @@ def _team_from_options(options):
         'vehicle_id': next(v['id'] for v in options['vehicles'] if v['available']),
         'notes': 'Food and water response team',
     }
+
+def _accept_driver_for_request(client, request_id, return_email, return_password):
+    conn=database.get_db()
+    assigned=conn.execute("SELECT u.email,u.password FROM response_assignments a JOIN users u ON u.id=a.driver_user_id WHERE a.request_id=? ORDER BY a.id DESC LIMIT 1",(request_id,)).fetchone()
+    conn.close()
+    password=next(candidate for candidate in ('driver123','driveDemo26!') if check_password_hash(assigned['password'],candidate))
+    client.post('/api/auth/login',json={'email':assigned['email'],'password':password})
+    task=next(item for item in client.get('/api/driver/assignments').get_json() if item['request_id']==request_id)
+    result=client.post(f"/api/driver/assignments/{task['assignment_id']}/accept",json={})
+    assert result.status_code==200,result.get_json()
+    client.post('/api/auth/login',json={'email':return_email,'password':return_password})
 
 
 def _login(client, email):
@@ -125,7 +137,7 @@ def test_ngo_can_claim_unverified_request_and_other_dashboards_show_winner(clien
     )
     assert competing_ngo_claim.status_code == 409
 
-    client.post('/api/auth/login', json={'email': 'ngo@drras.in', 'password': 'ngo123'})
+    _accept_driver_for_request(client,created['id'],'ngo@drras.in','ngo123')
     allocated = client.post(f"/api/requests/{created['id']}/allocate", json={})
     assert allocated.status_code == 200, allocated.get_json()
     dispatch = next(d for d in client.get('/api/dispatches').get_json() if d['request_id'] == created['id'])

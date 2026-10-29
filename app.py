@@ -538,11 +538,12 @@ def get_requests():
             CASE WHEN r.response_owner_type='ngo' AND r.response_organization_id=?
               AND EXISTS(SELECT 1 FROM response_assignments a WHERE a.request_id=r.id AND a.owner_type='ngo'
                 AND a.organization_id=? AND a.status IN ('Assigned','Active')) THEN 1 ELSE 0 END AS ngo_assignment_active,
-            CASE WHEN r.response_owner_type IS NULL AND r.verification_status!='Rejected'
+            CASE WHEN (r.response_owner_type IS NULL OR (r.response_owner_type='ngo' AND r.response_organization_id=?
+              AND NOT EXISTS(SELECT 1 FROM response_assignments x WHERE x.request_id=r.id AND x.owner_type='ngo' AND x.organization_id=? AND x.status IN ('Assigned','Active')))) AND r.verification_status!='Rejected'
               AND r.status NOT IN ('Rejected','Closed','Delivered','Duplicate','Cancelled') THEN 1 ELSE 0 END AS ngo_assignment_eligible
             FROM emergency_requests r
             LEFT JOIN organizations owner ON owner.id=r.response_organization_id
-            ORDER BY r.priority_score DESC,r.created_at DESC""",(org_id,org_id)).fetchall()
+            ORDER BY r.priority_score DESC,r.created_at DESC""",(org_id,org_id,org_id,org_id)).fetchall()
         return jsonify([dict(r) for r in rows])
 
     if user_role == 'Volunteer':
@@ -949,6 +950,9 @@ def advance_dispatch(id):
             return jsonify({'error': 'You are not authorized to advance another driver\'s dispatch.'}), 403
         elif not curr['driver_user_id'] and user_name and user_name != curr['driver']:
             return jsonify({'error': 'You are not authorized to advance another driver\'s dispatch.'}), 403
+        pending_decision=conn.execute("SELECT driver_decision FROM response_assignments WHERE dispatch_id=? AND driver_user_id=? ORDER BY id DESC LIMIT 1",(id,user_id)).fetchone()
+        if pending_decision and pending_decision['driver_decision']!='Accepted':
+            return jsonify({'error':'Accept this assigned dispatch before advancing the trip.','code':'DRIVER_ACCEPTANCE_PENDING'}),409
 
     elif user_role == 'Government Official' and not (curr['owner_type']=='government' and curr['owner_organization_id'] is None):
         return jsonify({'error':'Dispatch is outside Government ownership.'}),403

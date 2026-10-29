@@ -59,3 +59,14 @@ def test_driver_page_keeps_existing_map_dispatch_and_proof_authorization_workflo
     assert "where=' WHERE d.driver_user_id=? AND d.owner_type=? AND d.owner_organization_id IS ?'" in api
     assert "if row['driver_user_id'] != user_id:" in routes
     assert "if dsp['status'] != 'Arrived':" in (ROOT / 'services.py').read_text(encoding='utf-8')
+
+
+def test_driver_dashboard_has_database_backed_accept_and_reject_actions():
+    app_js = (ROOT / 'static' / 'js' / 'app.js').read_text(encoding='utf-8')
+    routes = (ROOT / 'api_routes.py').read_text(encoding='utf-8')
+    services = (ROOT / 'services.py').read_text(encoding='utf-8')
+    assert "fetch('/api/driver/assignments')" in app_js
+    assert 'driver-assignment-accept' in app_js and 'driver-assignment-decline' in app_js
+    assert "@api_bp.route('/api/driver/assignments/<int:assignment_id>/<action>'" in routes
+    assert 'decide_driver_assignment_service' in routes
+    assert 'DRIVER_ACCEPTANCE_PENDING' in services

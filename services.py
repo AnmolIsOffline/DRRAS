@@ -48,10 +48,11 @@ def claim_request_service(conn, request_id, owner_type, organization_id, actor_i
     claimed_at = datetime.now(timezone.utc).isoformat(timespec='seconds')
     changed = conn.execute("""UPDATE emergency_requests
         SET response_owner_type=?,response_organization_id=?,claimed_at=?
-        WHERE id=? AND response_owner_type IS NULL
+        WHERE id=? AND (response_owner_type IS NULL OR
+          (response_owner_type=? AND response_organization_id IS ?))
           AND NOT EXISTS(SELECT 1 FROM response_assignments a
               WHERE a.request_id=emergency_requests.id AND a.status IN ('Assigned','Active'))""",
-        (owner_type, organization_id, claimed_at, request_id)).rowcount
+        (owner_type, organization_id, claimed_at, request_id, owner_type, organization_id)).rowcount
     if changed != 1:
         raise BusinessLogicError("Another organization has already claimed this request.", code="REQUEST_CLAIMED", status_code=409)
 
@@ -111,7 +112,16 @@ def verify_request_service(conn, request_id, decision, reason, actor_id, actor_r
         if required_vehicle_capacity(conn,request_id) > int(vehicle['capacity_units'] or 0):
             raise BusinessLogicError('Selected Government vehicle does not have enough capacity for this request.',code='VEHICLE_CAPACITY_INSUFFICIENT',status_code=409)
         claim_request_service(conn, request_id, 'government', None, actor_id)
-        conn.execute("INSERT INTO response_assignments (request_id,owner_type,government_personnel_id,driver_user_id,vehicle_id,status,assigned_by_user_id,notes) VALUES (?,'government',?,?,?,'Assigned',?,?)", (request_id,response_personnel_id,driver_user_id,vehicle_id,actor_id,reason))
+        existing_assignment = conn.execute("SELECT id,status FROM response_assignments WHERE request_id=? AND owner_type='government' AND organization_id IS NULL", (request_id,)).fetchone()
+        if existing_assignment:
+            if existing_assignment['status'] != 'Cancelled':
+                raise BusinessLogicError('A Government response team is already assigned to this request.', code='ASSIGNMENT_EXISTS', status_code=409)
+            conn.execute("""UPDATE response_assignments SET government_personnel_id=?,volunteer_id=NULL,
+                driver_user_id=?,vehicle_id=?,dispatch_id=NULL,status='Assigned',driver_decision='Pending',
+                driver_decided_at=NULL,driver_decline_reason=NULL,assigned_by_user_id=?,assigned_at=CURRENT_TIMESTAMP,notes=?
+                WHERE id=?""", (response_personnel_id,driver_user_id,vehicle_id,actor_id,reason,existing_assignment['id']))
+        else:
+            conn.execute("INSERT INTO response_assignments (request_id,owner_type,government_personnel_id,driver_user_id,vehicle_id,status,driver_decision,assigned_by_user_id,notes) VALUES (?,'government',?,?,?,'Assigned','Pending',?,?)", (request_id,response_personnel_id,driver_user_id,vehicle_id,actor_id,reason))
         conn.execute("UPDATE vehicles SET status='Reserved',current_driver_user_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='Available'", (driver_user_id,vehicle_id))
         if conn.execute("SELECT changes()").fetchone()[0] != 1:
             raise BusinessLogicError('Selected vehicle was reserved by another operation. Refresh and retry.', code='VEHICLE_UNAVAILABLE', status_code=409)
@@ -222,6 +232,8 @@ def allocate_request_service(conn, request_id, actor_id, actor_role, idempotency
     assignment = conn.execute("SELECT * FROM response_assignments WHERE request_id=? AND owner_type=? AND organization_id IS ? AND status IN ('Assigned','Active') ORDER BY id DESC LIMIT 1", (request_id,expected_owner,actor_org)).fetchone()
     if not assignment:
         raise BusinessLogicError('A response person/Volunteer, approved Driver, and compatible vehicle must be assigned before resource allocation.', code='RESPONSE_ASSIGNMENT_REQUIRED', status_code=409)
+    if assignment['driver_decision'] != 'Accepted':
+        raise BusinessLogicError('The assigned Driver must accept the response assignment before resources are dispatched.', code='DRIVER_ACCEPTANCE_PENDING', status_code=409)
     if assignment['owner_type'] != expected_owner or (expected_owner == 'ngo' and assignment['organization_id'] != actor_org):
         raise BusinessLogicError('This response assignment is owned by a different organization.', code='ALLOCATION_SCOPE_DENIED', status_code=403)
     if selected_driver_id is not None and int(selected_driver_id) != assignment['driver_user_id']:
@@ -432,6 +444,10 @@ def driver_start_trip_service(conn, dispatch_id, actor_id, actor_name, actor_rol
         raise BusinessLogicError("You are not authorized to operate dispatches.", code="FORBIDDEN", status_code=403)
     if actor_role == 'Driver' and dsp['driver_user_id'] != actor_id:
         raise BusinessLogicError("You are not authorized to operate another driver's dispatch.", code="FORBIDDEN", status_code=403)
+    if actor_role == 'Driver':
+        decision = conn.execute("SELECT driver_decision FROM response_assignments WHERE dispatch_id=? AND driver_user_id=? ORDER BY id DESC LIMIT 1", (dispatch_id,actor_id)).fetchone()
+        if decision and decision['driver_decision'] != 'Accepted':
+            raise BusinessLogicError('Accept this assigned dispatch before starting the trip.', code='DRIVER_ACCEPTANCE_PENDING', status_code=409)
 
     if dsp['status'] in ('Delivered', 'Cancelled', 'En route'):
         raise BusinessLogicError(f"Cannot start trip from current status '{dsp['status']}'.", code="INVALID_STATUS", status_code=400)
@@ -1354,7 +1370,11 @@ def cancel_dispatch_service(conn, dispatch_id, actor_id, actor_role, reason):
     if not dsp:
         raise BusinessLogicError("Dispatch record not found", code="NOT_FOUND", status_code=404)
 
-    if actor_role not in ('Administrator', 'Government Official', 'NGO Coordinator'):
+    if actor_role == 'Driver':
+        assignment = conn.execute("SELECT driver_decision FROM response_assignments WHERE dispatch_id=? AND driver_user_id=? AND status IN ('Assigned','Active') ORDER BY id DESC LIMIT 1", (dispatch_id,actor_id)).fetchone()
+        if dsp['driver_user_id'] != actor_id or dsp['status'] != 'Loading' or not assignment or assignment['driver_decision'] != 'Pending':
+            raise BusinessLogicError('Drivers may reject only their own pending dispatch before it starts.', code='FORBIDDEN', status_code=403)
+    elif actor_role not in ('Administrator', 'Government Official', 'NGO Coordinator'):
         raise BusinessLogicError("Access denied. Insufficient role to cancel dispatch.", code="FORBIDDEN", status_code=403)
 
     if dsp['status'] in ('Delivered', 'Cancelled'):
@@ -1394,3 +1414,62 @@ def cancel_dispatch_service(conn, dispatch_id, actor_id, actor_role, reason):
     log_audit_event(conn, actor_id, 'CANCEL_DISPATCH', 'dispatches', dispatch_id, reason=reason)
     log_system_event(conn, 'dispatch_updated', {'id': dispatch_id, 'status': 'Cancelled'})
     return conn.execute("SELECT * FROM dispatches WHERE id = ?", (dispatch_id,)).fetchone()
+
+
+def decide_driver_assignment_service(conn, assignment_id, actor_id, action, reason=None):
+    """Accept or decline a response assignment belonging to the signed-in Driver."""
+    if action not in ('accept', 'decline'):
+        raise BusinessLogicError('Action must be accept or decline.', code='INVALID_ACTION', status_code=400)
+    row = conn.execute("""SELECT a.*,d.status AS dispatch_status,r.status AS request_status,
+        r.area,r.need,v.user_id AS volunteer_user_id
+        FROM response_assignments a
+        LEFT JOIN dispatches d ON d.id=a.dispatch_id
+        JOIN emergency_requests r ON r.id=a.request_id
+        LEFT JOIN volunteers v ON v.id=a.volunteer_id
+        WHERE a.id=?""", (assignment_id,)).fetchone()
+    if not row:
+        raise BusinessLogicError('Response assignment not found.', code='NOT_FOUND', status_code=404)
+    driver = conn.execute("SELECT role,organization_id FROM users WHERE id=? AND status='ACTIVE'", (actor_id,)).fetchone()
+    expected_owner = 'ngo' if driver and driver['organization_id'] is not None else 'government'
+    expected_org = driver['organization_id'] if expected_owner == 'ngo' else None
+    if not driver or driver['role'] != 'Driver' or row['driver_user_id'] != actor_id:
+        raise BusinessLogicError('Only the Driver assigned to this response may act on it.', code='FORBIDDEN', status_code=403)
+    if row['owner_type'] != expected_owner or row['organization_id'] != expected_org:
+        raise BusinessLogicError('Assignment is outside this Driver organization.', code='FORBIDDEN', status_code=403)
+    if row['status'] not in ('Assigned','Active'):
+        raise BusinessLogicError('This response assignment is no longer active.', code='INVALID_STATUS', status_code=409)
+    if row['driver_decision'] != 'Pending':
+        raise BusinessLogicError(f"This assignment has already been {row['driver_decision'].lower()}.", code='DECISION_ALREADY_RECORDED', status_code=409)
+    if row['dispatch_id'] and row['dispatch_status'] != 'Loading':
+        raise BusinessLogicError('A dispatch can only be accepted or declined before the trip starts.', code='INVALID_STATUS', status_code=409)
+
+    if action == 'accept':
+        conn.execute("UPDATE response_assignments SET driver_decision='Accepted',driver_decided_at=CURRENT_TIMESTAMP WHERE id=? AND driver_decision='Pending'", (assignment_id,))
+        if row['dispatch_id']:
+            conn.execute("UPDATE dispatches SET status='Ready',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='Loading'", (row['dispatch_id'],))
+        log_audit_event(conn, actor_id, 'ACCEPT_DRIVER_ASSIGNMENT', 'response_assignments', assignment_id,
+                        old_state={'driver_decision':'Pending'}, new_state={'driver_decision':'Accepted'})
+        log_system_event(conn, 'driver_assignment_updated', {'assignment_id':assignment_id,'request_id':row['request_id'],'decision':'Accepted','dispatch_id':row['dispatch_id']})
+        create_notification(conn, row['assigned_by_user_id'], 'driver_assignment_accepted', 'Driver accepted response assignment',
+                            f"The assigned Driver accepted request {row['request_id']}.", 'emergency_requests', row['request_id'])
+        return conn.execute("SELECT * FROM response_assignments WHERE id=?", (assignment_id,)).fetchone()
+
+    decline_reason = (reason or '').strip() or 'Declined by assigned Driver'
+    if row['dispatch_id']:
+        cancel_dispatch_service(conn, row['dispatch_id'], actor_id, 'Driver', decline_reason)
+    conn.execute("UPDATE response_assignments SET status='Cancelled',driver_decision='Declined',driver_decided_at=CURRENT_TIMESTAMP,driver_decline_reason=? WHERE id=?", (decline_reason,assignment_id))
+    if not row['dispatch_id'] and row['vehicle_id']:
+        conn.execute("UPDATE vehicles SET status='Available',current_driver_user_id=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND current_driver_user_id=?", (row['vehicle_id'],actor_id))
+    if row['volunteer_id']:
+        conn.execute("UPDATE volunteer_tasks SET status='Cancelled',review_notes=?,updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND volunteer_id=? AND status IN ('Assigned','Accepted','In Progress','Submitted for Review','Needs Correction')", (f"Driver declined the paired response: {decline_reason}",row['request_id'],row['volunteer_id']))
+        if row['volunteer_user_id']:
+            remaining = conn.execute("SELECT 1 FROM volunteer_tasks t JOIN volunteers v ON v.id=t.volunteer_id WHERE v.user_id=? AND t.status IN ('Assigned','Accepted','In Progress','Submitted for Review','Needs Correction') LIMIT 1", (row['volunteer_user_id'],)).fetchone()
+            if not remaining:
+                conn.execute("UPDATE volunteers SET status='Available' WHERE user_id=?", (row['volunteer_user_id'],))
+    conn.execute("INSERT INTO request_events (request_id,event_type,from_status,to_status,reason,actor_user_id,notes) VALUES (?,'DRIVER_DECLINED',?,?,?, ?,?)", (row['request_id'],row['request_status'],row['request_status'],decline_reason,actor_id,f"Driver declined response assignment {assignment_id}; owning team may assign a replacement."))
+    log_audit_event(conn, actor_id, 'DECLINE_DRIVER_ASSIGNMENT', 'response_assignments', assignment_id,
+                    old_state={'driver_decision':'Pending'}, new_state={'driver_decision':'Declined','reason':decline_reason}, reason=decline_reason)
+    log_system_event(conn, 'driver_assignment_updated', {'assignment_id':assignment_id,'request_id':row['request_id'],'decision':'Declined','dispatch_id':row['dispatch_id']})
+    create_notification(conn, row['assigned_by_user_id'], 'driver_assignment_declined', 'Driver declined response assignment',
+                        f"The assigned Driver declined request {row['request_id']}. Reassign an eligible Driver and vehicle.", 'emergency_requests', row['request_id'])
+    return conn.execute("SELECT * FROM response_assignments WHERE id=?", (assignment_id,)).fetchone()

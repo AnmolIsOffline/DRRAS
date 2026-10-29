@@ -1080,3 +1080,17 @@ def apply_migrations(conn):
                 WHERE registration_number IS NULL OR trim(registration_number)=''""")
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_vehicles_registration_number ON vehicles(registration_number)")
             cur.execute("INSERT INTO schema_migrations (version,description) VALUES (12,'Add unique persisted fleet registration numbers')")
+
+    # Migration 13: persist the Driver's decision on a response assignment.
+    # Existing assignments are treated as accepted so upgrades do not block trips
+    # already in progress; newly created assignments explicitly start as Pending.
+    applied = {row[0] for row in cur.execute("SELECT version FROM schema_migrations").fetchall()}
+    if 13 not in applied:
+        with conn:
+            if not table_has_column(conn, 'response_assignments', 'driver_decision'):
+                cur.execute("ALTER TABLE response_assignments ADD COLUMN driver_decision TEXT NOT NULL DEFAULT 'Accepted' CHECK(driver_decision IN ('Pending','Accepted','Declined'))")
+            if not table_has_column(conn, 'response_assignments', 'driver_decided_at'):
+                cur.execute("ALTER TABLE response_assignments ADD COLUMN driver_decided_at TEXT NULL")
+            if not table_has_column(conn, 'response_assignments', 'driver_decline_reason'):
+                cur.execute("ALTER TABLE response_assignments ADD COLUMN driver_decline_reason TEXT NULL")
+            cur.execute("INSERT INTO schema_migrations (version,description) VALUES (13,'Persist Driver acceptance or rejection for Government and NGO response assignments')")
